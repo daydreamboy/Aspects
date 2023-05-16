@@ -7,6 +7,7 @@
 
 #import "Aspects.h"
 #import <libkern/OSAtomic.h>
+#import <os/lock.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -120,18 +121,25 @@ static id aspect_add(id self, SEL selector, AspectOptions options, id block, NSE
     NSCParameterAssert(block);
 
     __block AspectIdentifier *identifier = nil;
+    __block NSError *errorL = nil;
+    
     aspect_performLocked(^{
-        if (aspect_isSelectorAllowedAndTrack(self, selector, options, error)) {
+        if (aspect_isSelectorAllowedAndTrack(self, selector, options, &errorL)) {
             AspectsContainer *aspectContainer = aspect_getContainerForObject(self, selector);
-            identifier = [AspectIdentifier identifierWithSelector:selector object:self options:options block:block error:error];
+            identifier = [AspectIdentifier identifierWithSelector:selector object:self options:options block:block error:&errorL];
             if (identifier) {
                 [aspectContainer addAspect:identifier withOptions:options];
 
                 // Modify the class to allow message interception.
-                aspect_prepareClassAndHookSelector(self, selector, error);
+                aspect_prepareClassAndHookSelector(self, selector, &errorL);
             }
         }
     });
+    
+    if (error) {
+        *error = errorL;
+    }
+    
     return identifier;
 }
 
@@ -139,6 +147,8 @@ static BOOL aspect_remove(AspectIdentifier *aspect, NSError **error) {
     NSCAssert([aspect isKindOfClass:AspectIdentifier.class], @"Must have correct type.");
 
     __block BOOL success = NO;
+    __block NSError *errorL = nil;
+    
     aspect_performLocked(^{
         id self = aspect.object; // strongify
         if (self) {
@@ -150,19 +160,28 @@ static BOOL aspect_remove(AspectIdentifier *aspect, NSError **error) {
             aspect.object = nil;
             aspect.block = nil;
             aspect.selector = NULL;
-        }else {
+        } else {
             NSString *errrorDesc = [NSString stringWithFormat:@"Unable to deregister hook. Object already deallocated: %@", aspect];
-            AspectError(AspectErrorRemoveObjectAlreadyDeallocated, errrorDesc);
+            
+            // AspectError(AspectErrorRemoveObjectAlreadyDeallocated, errrorDesc);
+            // Note: comment out the above line, and replace the following code instead
+            AspectLogError(@"Aspects: %@", errrorDesc);
+            errorL = [NSError errorWithDomain:AspectErrorDomain code:AspectErrorRemoveObjectAlreadyDeallocated userInfo:@{NSLocalizedDescriptionKey: errrorDesc}];
         }
     });
+    
+    if (error) {
+        *error = errorL;
+    }
+    
     return success;
 }
 
 static void aspect_performLocked(dispatch_block_t block) {
-    static OSSpinLock aspect_lock = OS_SPINLOCK_INIT;
-    OSSpinLockLock(&aspect_lock);
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    os_unfair_lock_lock(&lock);
     block();
-    OSSpinLockUnlock(&aspect_lock);
+    os_unfair_lock_unlock(&lock);
 }
 
 static SEL aspect_aliasForSelector(SEL selector) {
@@ -556,7 +575,7 @@ static void aspect_destroyContainerForObject(id<NSObject> self, SEL selector) {
 ///////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark - Selector Blacklist Checking
 
-static NSMutableDictionary *aspect_getSwizzledClassesDict() {
+static NSMutableDictionary *aspect_getSwizzledClassesDict(void) {
     static NSMutableDictionary *swizzledClassesDict;
     static dispatch_once_t pred;
     dispatch_once(&pred, ^{
